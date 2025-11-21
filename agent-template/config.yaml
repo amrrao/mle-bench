@@ -1,0 +1,20 @@
+# Copy this file to mle-bench/agents/<your-agent-name>/config.yaml
+# and replace every occurrence of `your-agent` with your actual agent ID.
+
+vars:
+  step_limit: &step_limit 500
+  time_limit: &time_limit 3600
+
+your-agent:
+  start: your-agent/start.sh
+  dockerfile: your-agent/Dockerfile
+  env_vars:
+    STEP_LIMIT: *step_limit
+    TIME_LIMIT_SECS: *time_limit
+
+your-agent/dev:
+  start: your-agent/start.sh
+  dockerfile: your-agent/Dockerfile
+  env_vars:
+    STEP_LIMIT: 50
+    TIME_LIMIT_SECS: 600
