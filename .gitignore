@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ============================================================================
+# Project-specific ignores
+# ============================================================================
+
+# Virtual environment (recreate on target machine using setup_tpu.sh)
+aide_env/
+
+# Kaggle cache data (too large, download on target)
+mle-bench/cache/
+
+# Local experiment runs
+mle-bench/runs/
+
+# IDE
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
