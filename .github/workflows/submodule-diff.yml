@@ -1,0 +1,16 @@
+name: Submodule Diff
+on: [pull_request]
+
+jobs:
+  submodule-summary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Generate Submodule Diff
+        run: |
+          echo "### Submodule Changes" >> $GITHUB_STEP_SUMMARY
+          git submodule foreach 'git diff HEAD^ HEAD' >> $GITHUB_STEP_SUMMARY
