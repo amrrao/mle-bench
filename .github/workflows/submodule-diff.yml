@@ -2,6 +2,7 @@ name: Submodule Diff
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
 permissions:
   pull-requests: write
   contents: read
