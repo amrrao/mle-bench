@@ -23,7 +23,7 @@ ARG REQUIREMENTS=${AGENT_DIR}/requirements.txt
 # Agent files from mle-bench/agents/aide (context = repo root)
 COPY mle-bench/agents/aide/ ${AGENT_DIR}/
 # Overwrite with root-level aideml so pip install uses this copy
-COPY aideml ${AGENT_DIR}/aideml
+COPY AIDE_ML ${AGENT_DIR}/AIDE_ML
 
 RUN apt-get update && apt-get install ffmpeg libsm6 libxext6 -y
 
