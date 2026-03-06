@@ -1,6 +1,0 @@
-# List the Python packages your agent needs.
-# These defaults support the baseline template—feel free to edit.
-
-pandas>=2.0.0
-numpy>=1.24.0
-scikit-learn>=1.2.0
