@@ -1,3 +1,6 @@
 [submodule "mle-bench"]
 	path = mle-bench
 	url = https://github.com/tingtang2/mle-bench.git
+[submodule "MLEvolve"]
+	path = MLEvolve
+	url = git@github.com:abhigyan-ach/llms-for-mle-bench.git
