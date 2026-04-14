@@ -3,4 +3,5 @@
 	url = https://github.com/tingtang2/mle-bench.git
 [submodule "MLEvolve"]
 	path = MLEvolve
-	url = git@github.com:abhigyan-ach/llms-for-mle-bench.git
+	url = git@github.com:abhigyan-ach/MLEvolve.git
+	branch = MLEvolve-Integrated
