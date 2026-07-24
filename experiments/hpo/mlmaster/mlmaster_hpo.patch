@@ -1,0 +1,458 @@
+diff --git a/agent/mcts_agent.py b/agent/mcts_agent.py
+index 6425025..fab188f 100755
+--- a/agent/mcts_agent.py
++++ b/agent/mcts_agent.py
+@@ -3,6 +3,7 @@ import logging
+ import random
+ import os
+ import time
++import re
+ from typing import Any, Callable, cast, Tuple, List, Literal
+ import math
+ import humanize
+@@ -96,6 +97,9 @@ class MCTSAgent:
+         self.journal_lock = threading.Lock()
+         self.save_node_lock = threading.Lock()
+         self.start_time = time.time()
++        self.seen_hpo_signatures = set()
++        self.baseline_node = None
++        self.in_baseline_phase = True
+         
+     @property
+     def _prompt_environment(self):
+@@ -156,6 +160,26 @@ class MCTSAgent:
+                 f"The evaluation should be based on {self.acfg.k_fold_validation}-fold cross-validation but only if that's an appropriate evaluation for the task at hand."
+             )
+ 
++        impl_guideline.append(
++            "Use a TWO-PHASE training strategy when possible: "
++            "(1) quick hyperparameter search on a reduced budget or subsample, "
++            "(2) retrain the best configuration on full data."
++        )
++
++        impl_guideline.append(
++            "**All categorical or object columns MUST be encoded (e.g., target encoding, ordinal encoding, or one-hot) before hyperparameter optimization.** "
++            "Failures due to data types will invalidate the solution."
++        )
++
++        impl_guideline.append(
++            "**Prefer XGBoost for hyperparameter optimization unless all features are numeric and pre-encoded.** "
++            "Avoid LightGBM if object or categorical dtypes are present."
++        )
++
++        impl_guideline.append(
++            "Limit hyperparameter search to 10–15 trials maximum. Prioritize robustness and reliability over exotic models or complex configurations."
++        )
++
+         return {"Implementation guideline": impl_guideline}
+     
+     @property
+@@ -190,7 +214,12 @@ class MCTSAgent:
+         prompt["Instructions"] |= self._prompt_resp_fmt
+         prompt["Instructions"] |= {
+             "Solution sketch guideline": [
+-                "- This first solution design should be relatively simple, without ensembling or hyper-parameter optimization.\n",
++                "- The first solution design should include a SIMPLE but REAL hyperparameter search.\n",
++                "- Use a SMALL search budget (e.g., 10–15 trials or configs) to establish a strong baseline.\n",
++                "- Prefer RandomizedSearchCV, Optuna, or a small manual sweep.\n",
++                "- Do NOT over-optimize; this is an initial pass. Prioritize robustness over sophistication.\n",
++                "- **Prefer XGBoost for hyperparameter optimization unless all features are numeric and pre-encoded.**\n",
++                "- **Avoid LightGBM if object or categorical dtypes are present.**\n",
+                 "- When proposing the design, take the Memory section into account.\n",
+                 "- In addition to incorporating the Memory module, it is **crucial** that your proposed solution **is distinctly different from** the existing designs in the Memory section.\n",
+                 "- Don't propose the same modelling solution but keep the evaluation the same.\n",
+@@ -262,16 +291,21 @@ The memory of previous solutions used to solve task is provided below:
+         }
+ 
+         prompt["Instructions"] |= self._prompt_resp_fmt
++        improvement_guidelines = [
++            "- The solution sketch should be a brief natural language description of how the previous solution can be improved.\n",
++            "- You should be very specific and should only propose a single actionable improvement.\n",
++            "- This improvement should be atomic so that we can experimentally evaluate the effect of the proposed change.\n",
++            "- If hyperparameter tuning is already present, EXPAND the search space or increase trials (up to 15 max) rather than changing the model.\n",
++            "- **Prefer XGBoost for hyperparameter optimization unless all features are numeric and pre-encoded.**\n",
++            "- **Avoid LightGBM if object or categorical dtypes are present.**\n",
++            "- When proposing the design, take the Memory section into account.\n",
++            "- In addition to incorporating the Memory module, it is **crucial** that your proposed solution **is distinctly different from** the existing designs in the Memory section.\n",
++            "- The solution sketch should be 3-5 sentences.\n",
++            "- Don't suggest to do EDA.\n",
++        ]
++        
+         prompt["Instructions"] |= {
+-            "Solution improvement sketch guideline": [
+-                "- The solution sketch should be a brief natural language description of how the previous solution can be improved.\n",
+-                "- You should be very specific and should only propose a single actionable improvement.\n",
+-                "- This improvement should be atomic so that we can experimentally evaluate the effect of the proposed change.\n",
+-                "- When proposing the design, take the Memory section into account.\n",
+-                "- In addition to incorporating the Memory module, it is **crucial** that your proposed solution **is distinctly different from** the existing designs in the Memory section.\n",
+-                "- The solution sketch should be 3-5 sentences.\n",
+-                "- Don't suggest to do EDA.\n",
+-            ],
++            "Solution improvement sketch guideline": improvement_guidelines,
+         }
+         prompt["Instructions"] |= self._prompt_impl_guideline
+         output = wrap_code(parent_node.term_out, lang="")
+@@ -349,11 +383,24 @@ The memory of previous solutions used to improve performance is provided below:
+             "Instructions": {},
+         }
+         prompt["Instructions"] |= self._prompt_resp_fmt
++        bugfix_guidelines = [
++            "- You should write a brief natural language description (3-5 sentences) of how the issue in the previous implementation can be fixed.\n",
++            "- Don't suggest to do EDA.\n",
++        ]
++        
++        # Check if node was marked buggy due to missing hyperparameter tuning
++        missing_hpo = getattr(parent_node, '_missing_hpo', False)
++        
++        if missing_hpo:
++            # Special instructions for missing hyperparameter tuning
++            bugfix_guidelines.append(
++                "- The previous solution executed successfully but was rejected because it does not implement explicit hyperparameter optimization.\n"
++                "- You MUST add a concrete hyperparameter optimization routine (e.g., Optuna study, RandomizedSearchCV, GridSearchCV, or a manual parameter search over >=3 configs).\n"
++                "- The hyperparameter search must evaluate multiple configurations on a validation split/CV and select the best config, then train the final model with the selected config.\n"
++            )
++        
+         prompt["Instructions"] |= {
+-            "Bugfix improvement sketch guideline": [
+-                "- You should write a brief natural language description (3-5 sentences) of how the issue in the previous implementation can be fixed.\n",
+-                "- Don't suggest to do EDA.\n",
+-            ],
++            "Bugfix improvement sketch guideline": bugfix_guidelines,
+         }
+         prompt["Instructions"] |= self._prompt_impl_guideline
+ 
+@@ -423,6 +470,126 @@ The memory of previous solutions used to improve performance is provided below:
+         logger.info("Final plan + code extraction attempt failed, giving up...")
+         return "", completion_text  # type: ignore
+     
++    def _score_hyperparameter_tuning(self, code: str) -> int:
++        """
++        Uses an LLM to judge whether the code performs real hyperparameter tuning.
++        Returns an integer score from 0-3 (0=NONE, 1=MINIMAL, 2=MODERATE, 3=EXTENSIVE).
++        Uses OpenAI API (gpt-4o-2024-08-06) for the check.
++        """
++        system_prompt = (
++            "You are a STRICT ML code reviewer.\n"
++            "Evaluate the QUALITY and DEPTH of hyperparameter tuning in the following Python code.\n\n"
++
++            "Score hyperparameter tuning on a scale from 0 to 3:\n\n"
++
++            "0 = NONE\n"
++            "- No hyperparameter tuning\n"
++            "- Fixed hyperparameters\n"
++            "- cross_val_score without parameter search\n\n"
++
++            "1 = MINIMAL\n"
++            "- Token or superficial tuning\n"
++            "- Only one hyperparameter tuned over 1–2 values\n"
++            "- GridSearchCV or RandomizedSearchCV with <5 total configurations\n"
++            "- RandomizedSearchCV with n_iter < 5\n\n"
++
++            "2 = MODERATE\n"
++            "- Valid hyperparameter tuning but limited in scope\n"
++            "- Either:\n"
++            "  * One hyperparameter searched over ≥3 values, OR\n"
++            "  * Two or more hyperparameters searched over ≥2 values each\n"
++            "- ≥5 total configurations evaluated\n"
++            "- Model selection based on validation or cross-validation\n\n"
++
++            "3 = EXTENSIVE\n"
++            "- Systematic, non-trivial hyperparameter optimization\n"
++            "- Multiple hyperparameters jointly optimized\n"
++            "- ≥10 total configurations or trials evaluated\n"
++            "- Clear use of GridSearchCV, RandomizedSearchCV (n_iter ≥10), Optuna, Hyperopt, or Bayesian optimization\n"
++            "- Best configuration explicitly selected and used\n\n"
++
++            "Valid tuning methods include:\n"
++            "- GridSearchCV\n"
++            "- RandomizedSearchCV\n"
++            "- Optuna / Hyperopt / Bayesian optimization\n"
++            "- Manual loops evaluating multiple configurations\n\n"
++
++            "Respond ONLY with a single integer: 0, 1, 2, or 3."
++        )
++
++
++        user_prompt = f"```python\n{code}\n```"
++
++        try:
++            resp = query(
++                system_message=system_prompt,
++                user_message=user_prompt,
++                model="gpt-4o-2024-08-06",  # Use OpenAI model for HPO check
++                temperature=0,
++                convert_system_to_user=False,
++                cfg=self.cfg
++            )
++            # Extract integer score from response (look for 0, 1, 2, or 3)
++            resp_str = str(resp).strip()
++            score = None
++            for char in resp_str:
++                if char.isdigit() and int(char) in [0, 1, 2, 3]:
++                    score = int(char)
++                    break
++            
++            # If no single digit found, try to extract from the string using regex
++            if score is None:
++                match = re.search(r'\b([0-3])\b', resp_str)
++                if match:
++                    score = int(match.group(1))
++            
++            if score is None:
++                logger.warning(f"Could not parse HPO score from response: {resp_str}. Defaulting to 0.")
++                return 0
++            
++            # HARD anti-fake-HPO rules
++            code_lower = code.lower()
++
++            # Task-aware default search spaces: detect model family and check for relevant hyperparameters
++            expected_keys = []
++            if "xgboost" in code_lower or "xgb" in code_lower:
++                expected_keys = ["max_depth", "learning_rate", "n_estimators", "subsample", "colsample_bytree"]
++            elif "lightgbm" in code_lower or "lgbm" in code_lower:
++                expected_keys = ["num_leaves", "learning_rate", "n_estimators", "feature_fraction"]
++            elif "logisticregression" in code_lower or "logistic_regression" in code_lower:
++                expected_keys = ["C", "penalty"]
++
++            # Penalize missing expected keys for detected model families
++            if expected_keys:
++                missing = sum(1 for k in expected_keys if k not in code_lower)
++                if missing >= 2:
++                    logger.info(f"HPO score penalized: missing {missing} expected hyperparameters for detected model family")
++                    score = min(score, 1)
++
++            # Cap score if RandomizedSearchCV is weak
++            if "randomizedsearchcv" in code_lower:
++                if re.search(r"n_iter\s*=\s*[0-4]\b", code_lower):
++                    score = min(score, 1)
++
++            # Cap score if GridSearch is tiny
++            if "gridsearchcv" in code_lower:
++                if re.search(r"param_grid\s*=\s*{\s*[^}]*}", code_lower):
++                    score = min(score, 1)
++
++            # Cap score if best params never reused
++            if not re.search(r"best_params_|best_trial|study\.best", code_lower):
++                score = min(score, 1)
++
++            logger.info(f"Hyperparameter tuning score: {score}")
++            return score
++        except Exception as e:
++            logger.warning(f"Hyperparameter tuning LLM check failed: {e}. Defaulting to 0.")
++            return 0
++    
++    def _hpo_signature(self, code: str) -> str:
++        keys = re.findall(r"(n_estimators|max_depth|learning_rate|C|alpha|lambda)", code)
++        return "|".join(sorted(set(keys)))
++    
+     def update_data_preview(
+         self,
+     ):
+@@ -527,6 +694,18 @@ The memory of previous solutions used to improve performance is provided below:
+                     logger.error(f"An unexpected error occurred: {res}, skip this stage.")
+                     node.is_valid = True # set is_valid to True as default if using server is set but we can not connext to the server
+ 
++            # Check for hyperparameter tuning if required (soft enforcement via reward shaping)
++            if not node.is_buggy and self.acfg.require_hyperparameter_tuning:
++                logger.info(f"Checking for hyperparameter tuning in node {node.id}")
++                hpo_score = self._score_hyperparameter_tuning(node.code)
++                node.hpo_score = hpo_score
++                if hpo_score < 2:
++                    logger.info(
++                        f"Node {node.id} HPO score: {hpo_score} (will be penalized in reward, but not rejected)"
++                    )
++                else:
++                    logger.info(f"Node {node.id} HPO score: {hpo_score} (will receive bonus in reward)")
++
+             if node.is_buggy:
+                 logger.info(
+                     f"Parsed results: Node {node.id} is buggy and/or did not produce a submission.csv"
+@@ -645,6 +824,18 @@ The memory of previous solutions used to improve performance is provided below:
+             else:
+                 logger.error(f"An unexpected error occurred: {res}, skip this stage.")
+ 
++        # Check for hyperparameter tuning if required (soft enforcement via reward shaping)
++        if not node.is_buggy and self.acfg.require_hyperparameter_tuning:
++            logger.info(f"Checking for hyperparameter tuning in node {node.id}")
++            hpo_score = self._score_hyperparameter_tuning(node.code)
++            node.hpo_score = hpo_score
++            if hpo_score < 2:
++                logger.info(
++                    f"Node {node.id} HPO score: {hpo_score} (will be penalized in reward, but not rejected)"
++                )
++            else:
++                logger.info(f"Node {node.id} HPO score: {hpo_score} (will receive bonus in reward)")
++
+         if node.is_buggy:
+             logger.info(
+                 f"Parsed results: Node {node.id} is buggy and/or did not produce a submission.csv"
+@@ -729,14 +920,20 @@ The memory of previous solutions used to improve performance is provided below:
+             logger.info(f"For node {node.id}, there are {len(node.children) - len(filtered_children)}/{len(node.children)} is locked.")
+             selected_node = node
+             if len(filtered_children) > 0:
+-                selected_node = max(filtered_children, key=lambda child: child.uct_value(exploration_constant = self.get_C()))
++                selected_node = max(filtered_children, key=lambda child: (
++                    child.uct_value(exploration_constant=self.get_C())
++                    + (0.25 * getattr(child, "hpo_score", 0) if not self.in_baseline_phase else 0)
++                ))
+                 
+             if selected_node.stage == "draft":
+                 selected_node.lock = True
+                 logger.info(f"Draft node {selected_node.id} is locked.")
+             return selected_node
+         else:
+-            return max(node.children, key=lambda child: child.uct_value(exploration_constant = self.get_C()))
++            return max(node.children, key=lambda child: (
++                child.uct_value(exploration_constant=self.get_C())
++                + (0.25 * getattr(child, "hpo_score", 0) if not self.in_baseline_phase else 0)
++            ))
+ 
+     
+     def check_improvement(self, cur_node: MCTSNode, parent_node: MCTSNode):
+@@ -803,6 +1000,43 @@ The memory of previous solutions used to improve performance is provided below:
+                 reward += 1
+             else:
+                 reward += 1
++        
++        # Reward hyperparameter tuning with asymmetric shaping
++        # Only apply HPO pressure after baseline phase ends
++        if not self.in_baseline_phase:
++            # Only apply HPO pressure after initial exploration phase (30% of steps)
++            if self.current_step > self.acfg.steps * 0.3:
++                hpo_score = getattr(node, "hpo_score", 0)
++                if hpo_score == 0:
++                    reward -= 0.3
++                elif hpo_score == 1:
++                    reward -= 0.1
++                elif hpo_score == 2:
++                    reward += 0.15
++                elif hpo_score == 3:
++                    reward += 0.35
++            
++            # Penalize repeated HPO templates (only after baseline phase)
++            sig = self._hpo_signature(node.code)
++            if sig in self.seen_hpo_signatures:
++                reward -= 0.3
++            else:
++                self.seen_hpo_signatures.add(sig)
++        
++        # Model diversity bonus: encourage single-model focus, discourage early ensembling
++        model_keywords = [
++            "xgboost", "lgbm", "lightgbm", "catboost",
++            "randomforest", "extratrees", "svm",
++            "logisticregression", "neural", "torch"
++        ]
++        code_lower = node.code.lower()
++        used = sum(k in code_lower for k in model_keywords)
++        
++        if used == 1:
++            reward += 0.15  # clean, single-model focus
++        elif used >= 2:
++            reward -= 0.1   # ensembles too early
++        
+         return reward
+             
+     def is_root(self, node: MCTSNode):
+@@ -896,12 +1130,43 @@ The memory of previous solutions used to improve performance is provided below:
+         if not node or node.stage == "root":
+             node = self.select(self.virtual_root)
+ 
++        # End baseline phase after 15% of steps
++        if self.in_baseline_phase and self.current_step >= int(0.15 * self.acfg.steps):
++            self.in_baseline_phase = False
++            if self.baseline_node:
++                logger.info(f"Baseline phase ended. Baseline metric: {self.baseline_node.metric.value}")
++            else:
++                logger.warning("Baseline phase ended but no baseline node was captured!")
++
+         _root, result_node = self._step_search(node, exec_callback=exec_callback)
+         if result_node:
+             submission_file_path = self.cfg.workspace_dir / "submission" / f"submission_{result_node.id}.csv"
+             logger.info(f"In the search step from node {node.id}, the generated node is {result_node.id}, the metric is {result_node.metric.value}")
++        
++        # Capture baseline node during baseline phase
++        if self.in_baseline_phase and result_node and not result_node.is_buggy and result_node.metric.value is not None:
++            if self.baseline_node is None or result_node.metric > self.baseline_node.metric:
++                self.baseline_node = result_node
++                logger.info(f"Updated baseline node to {result_node.id} with metric {result_node.metric.value}")
++        
+         if result_node and result_node.metric.value is not None:
+-            if self.best_node is None or self.best_node.metric < result_node.metric:
++            # Determine if we should promote this node
++            if self.in_baseline_phase:
++                # During baseline phase, promote any better node
++                promote = True
++            else:
++                # After baseline phase, only promote if it beats baseline
++                promote = (
++                    self.baseline_node is None
++                    or result_node.metric > self.baseline_node.metric
++                )
++                if not promote:
++                    logger.info(
++                        f"Node {result_node.id} (metric: {result_node.metric.value}) "
++                        f"does not beat baseline (metric: {self.baseline_node.metric.value}), not promoting"
++                    )
++            
++            if promote and (self.best_node is None or self.best_node.metric < result_node.metric):
+                 logger.info(f"Node {result_node.id} is the best node so far")
+                 if self.best_node is None or result_node.is_valid is True:
+                     self.best_node = result_node
+@@ -922,7 +1187,7 @@ The memory of previous solutions used to improve performance is provided below:
+                     logger.info(f"Node {result_node.id} is a invalid node")
+                     logger.info(f"Node {self.best_node.id} is still the best node")
+             else:
+-                if self.best_node.is_valid is False:
++                if self.best_node and self.best_node.is_valid is False:
+                     logger.info(f"Node {self.best_node.id} is invalid, {result_node.id} is the best node so far")
+                     self.best_node = result_node
+                     best_solution_dir = self.cfg.workspace_dir / "best_solution"
+@@ -949,6 +1214,28 @@ The memory of previous solutions used to improve performance is provided below:
+         if self.best_node:
+             logger.info(f"Best metric value is {self.best_node.metric.value}.")
+ 
++        # Final fallback: if no HPO node beat baseline, ensure baseline is used
++        if not self.in_baseline_phase and self.baseline_node and self.best_node:
++            if self.best_node.metric < self.baseline_node.metric:
++                logger.info(
++                    f"Best node ({self.best_node.metric.value}) worse than baseline "
++                    f"({self.baseline_node.metric.value}), falling back to baseline"
++                )
++                self.best_node = self.baseline_node
++                # Update files to baseline
++                baseline_submission_path = self.cfg.workspace_dir / "submission" / f"submission_{self.baseline_node.id}.csv"
++                best_solution_dir = self.cfg.workspace_dir / "best_solution"
++                best_submission_dir = self.cfg.workspace_dir / "best_submission"
++                with self.save_node_lock:
++                    best_solution_dir.mkdir(exist_ok=True, parents=True)
++                    best_submission_dir.mkdir(exist_ok=True, parents=True)
++                    if baseline_submission_path.exists():
++                        shutil.copy(baseline_submission_path, best_submission_dir / "submission.csv")
++                    with open(best_solution_dir / "solution.py", "w") as f:
++                        f.write(self.baseline_node.code)
++                    with open(best_solution_dir / "node_id.txt", "w") as f:
++                        f.write(str(self.baseline_node.id))
++
+         if not self.acfg.save_all_submission and result_node and os.path.exists(submission_file_path):
+             os.remove(submission_file_path)
+         self.current_step = len(self.journal)
+@@ -958,4 +1245,5 @@ The memory of previous solutions used to improve performance is provided below:
+         else:
+             logger.info(f"agent return {result_node.id} to main")
+             return result_node
+-        
+\ No newline at end of file
++        
++
+diff --git a/utils/config_mcts.py b/utils/config_mcts.py
+index adcf1de..4239731 100755
+--- a/utils/config_mcts.py
++++ b/utils/config_mcts.py
+@@ -83,6 +83,7 @@ class AgentConfig:
+     convert_system_to_user: bool
+     obfuscate: bool
+     check_format: bool
++    require_hyperparameter_tuning: bool
+     save_all_submission: bool
+     steerable_reasoning: bool
+     code: StageConfig
