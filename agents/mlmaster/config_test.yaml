@@ -1,5 +1,5 @@
 vars:
-  time_limit: &time_limit 720 # 12 minutes (720 seconds) for testing
+  time_limit: &time_limit 720
   step_count: &step_count 500
 
 defaults: &defaults
@@ -11,20 +11,20 @@ defaults: &defaults
     STEP_LIMIT: *step_count
 
 kwargs_common: &kwargs_common
-  agent.code.model: gpt-4.1
-  agent.code.temp: 0.5
+  agent.code.model: gpt-5-mini
+  agent.code.temp: 1.0
   agent.code.base_url: "https://api.openai.com/v1"
   agent.code.api_key: ${OPENAI_API_KEY}
-  agent.feedback.model: gpt-4.1
-  agent.feedback.temp: 0.5
+  agent.feedback.model: gpt-5-mini
+  agent.feedback.temp: 1.0
   agent.feedback.base_url: "https://api.openai.com/v1"
   agent.feedback.api_key: ${OPENAI_API_KEY}
   agent.steps: *step_count
-  agent.steerable_reasoning: false  # Set to false for OpenAI models
+  agent.steerable_reasoning: false
   agent.check_format: true
-  agent.require_hyperparameter_tuning: true  # Enforce hyperparameter tuning
-  start_cpu: 0  # Still in kwargs for Python, but also in env_vars for bash script
-  cpus_per_task: 22  # CPUs per run (used by start.sh taskset)
+  agent.require_hyperparameter_tuning: false
+  start_cpu: 0
+  cpus_per_task: 22
 
 mlmaster:
   <<: *defaults
@@ -32,4 +32,15 @@ mlmaster:
     <<: *kwargs_common
   env_vars:
     <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+mlmaster/smoke:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.steps: 15
+  env_vars:
+    <<: *env_vars
+    TIME_LIMIT_SECS: 600
+    STEP_LIMIT: 15
     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

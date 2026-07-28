@@ -1,0 +1,7 @@
+# Overlay-only image for HPO factorial variants.
+# Full pip rebuild is flaky (torch_cluster); reuse existing mlmaster:latest env.
+FROM mlmaster:latest
+
+ARG AGENT_DIR=/home/agent
+COPY additional_notes.txt ${AGENT_DIR}/additional_notes.txt
+COPY agent/mcts_agent.py ${AGENT_DIR}/agent/mcts_agent.py
